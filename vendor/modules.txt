@@ -1,0 +1,4 @@
+# github.com/hashicorp/golang-lru v0.5.4
+## explicit
+github.com/hashicorp/golang-lru
+github.com/hashicorp/golang-lru/simplelru
