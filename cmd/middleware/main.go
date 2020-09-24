@@ -10,18 +10,54 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
-	"fmt"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
+
+	goflag "flag"
 
 	lru "github.com/hashicorp/golang-lru"
+	flag "github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/util/sets"
+	cliflag "k8s.io/component-base/cli/flag"
+	klog "k8s.io/klog/v2"
 )
 
 var (
 	cache *lru.Cache
+
+	// options
+	optMethods []string
+	optHosts   []string
+	optHeaders cliflag.MapStringString
+	optPath    string
+
+	// parsed options
+	allowedMethods sets.String
+	allowedHosts   sets.String
+	pathRegexp     *regexp.Regexp
 )
 
 func init() {
+	// register klog flags to pflag.CommandLine
+	klog.InitFlags(nil)
+	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
+	flag.StringSliceVar(&optMethods, "methods", optMethods, "allowed methods")
+	flag.StringSliceVar(&optHosts, "hosts", optHosts, "allowed hosts")
+	flag.StringVar(&optPath, "path", optPath, "allowed path in regex")
+	flag.Var(&optHeaders, "headers", "allowed headers in map")
+	flag.Parse()
+
+	for _, m := range optMethods {
+		allowedMethods.Insert(strings.ToLower(m))
+	}
+	for _, m := range optHosts {
+		allowedHosts.Insert(strings.ToLower(m))
+	}
+	pathRegexp = regexp.MustCompile(optPath)
+
+	// initialize cache
 	var err error
 	cache, err = lru.New(1024)
 	if err != nil {
@@ -29,7 +65,7 @@ func init() {
 	}
 }
 
-func process(buf []byte) {
+func process(buf []byte) (skipped bool) {
 	// First byte indicate payload type, possible values:
 	//  1 - Request
 	//  2 - Response
@@ -42,20 +78,40 @@ func process(buf []byte) {
 	meta := bytes.Split(header, []byte(" "))
 
 	// For each request you should receive 3 payloads (request, response, replayed response) with same request id
-	reqID := string(meta[1])
-	payload := buf[headerSize:]
+	var (
+		err     error
+		reqID   = string(meta[1])
+		req     *http.Request
+		payload = buf[headerSize:]
+	)
+
+	defer func() {
+		if skipped {
+			if payloadType == '1' {
+				klog.V(1).Infof("skipped request: %s %s", req.Method, req.URL.String())
+			}
+		}
+	}()
 
 	switch payloadType {
 	case '1': // Request
-		req, err := http.ReadRequest(bufio.NewReader((bytes.NewReader(payload))))
+		req, err = http.ReadRequest(bufio.NewReader((bytes.NewReader(payload))))
 		if err != nil {
 			panic(err)
 		}
-		cache.Add(reqID, req)
-		if req.Method != "GET" {
+		if !allowedMethods.Has(strings.ToLower(req.Method)) {
+			skipped = true
 			return
 		}
-		fmt.Fprintf(os.Stderr, "method: %s, host: %s", req.Method, req.Header["Host"])
+		if !allowedHosts.Has(strings.ToLower(req.Host)) {
+			skipped = true
+			return
+		}
+		if !pathRegexp.MatchString(req.URL.Path) {
+			skipped = true
+			return
+		}
+		cache.Add(reqID, req)
 		// Emitting data back
 		os.Stdout.Write(encode(buf))
 	case '2': // Orginal reponse
@@ -63,9 +119,13 @@ func process(buf []byte) {
 	default:
 		panic("unreachable")
 	}
+	return
 }
 
 func main() {
+	flag.CommandLine.VisitAll(func(flag *flag.Flag) {
+		klog.Infof("FLAG: --%s=%q", flag.Name, flag.Value)
+	})
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for scanner.Scan() {
