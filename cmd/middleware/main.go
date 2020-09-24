@@ -34,10 +34,17 @@ var (
 	optPath    string
 
 	// parsed options
-	allowedMethods sets.String
-	allowedHosts   sets.String
+	allowedMethods = sets.String{}
+	allowedHosts   = sets.String{}
 	pathRegexp     *regexp.Regexp
 )
+
+type replayRequest struct {
+	ID           string
+	req          *http.Request
+	respOrginal  *http.Response
+	respReplayed *http.Response
+}
 
 func init() {
 	// register klog flags to pflag.CommandLine
@@ -61,7 +68,7 @@ func init() {
 	var err error
 	cache, err = lru.New(1024)
 	if err != nil {
-		panic(err)
+		klog.Fatal(err)
 	}
 }
 
@@ -82,6 +89,7 @@ func process(buf []byte) (skipped bool) {
 		err     error
 		reqID   = string(meta[1])
 		req     *http.Request
+		resp    *http.Response
 		payload = buf[headerSize:]
 	)
 
@@ -97,7 +105,8 @@ func process(buf []byte) (skipped bool) {
 	case '1': // Request
 		req, err = http.ReadRequest(bufio.NewReader((bytes.NewReader(payload))))
 		if err != nil {
-			panic(err)
+			klog.Warningf("cannot parse request payload: %s", payload)
+			return
 		}
 		if !allowedMethods.Has(strings.ToLower(req.Method)) {
 			skipped = true
@@ -111,11 +120,37 @@ func process(buf []byte) (skipped bool) {
 			skipped = true
 			return
 		}
-		cache.Add(reqID, req)
-		// Emitting data back
+		cache.Add(reqID, &replayRequest{
+			ID:  reqID,
+			req: req,
+		})
+		// Emitting the request back
 		os.Stdout.Write(encode(buf))
 	case '2': // Orginal reponse
+		replayRequestFromCache, ok := cache.Get(reqID)
+		if !ok {
+			klog.Infof("request of ID %s does not exist, skipped", reqID)
+			return
+		}
+		replayReq := replayRequestFromCache.(*replayRequest)
+		resp, err = http.ReadResponse(bufio.NewReader((bytes.NewReader(payload))), replayReq.req)
+		if err != nil {
+			klog.Fatal(err)
+		}
+		replayReq.respOrginal = resp
 	case '3': // Replayed response
+		replayRequestFromCache, ok := cache.Get(reqID)
+		if !ok {
+			klog.Infof("request of ID %s is cleared, skipped")
+			return
+		}
+		replayReq := replayRequestFromCache.(*replayRequest)
+		resp, err = http.ReadResponse(bufio.NewReader((bytes.NewReader(payload))), replayReq.req)
+		if err != nil {
+			klog.Fatal(err)
+		}
+		replayReq.respReplayed = resp
+		klog.Infof("[%s] %s %s, original status: %s, replay status: %s", replayReq.ID, replayReq.req.Method, replayReq.req.URL.String(), replayReq.respOrginal.Status, replayReq.respReplayed.Status)
 	default:
 		panic("unreachable")
 	}
