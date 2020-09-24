@@ -10,12 +10,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	goflag "flag"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
-
-	goflag "flag"
 
 	lru "github.com/hashicorp/golang-lru"
 	flag "github.com/spf13/pflag"
@@ -27,16 +25,18 @@ import (
 var (
 	cache *lru.Cache
 
+	maxInputSize = 100 * 1024 * 1024
+
 	// options
-	optMethods []string
-	optHosts   []string
-	optHeaders cliflag.MapStringString
-	optPath    string
+	optMethods      []string
+	optHosts        []string
+	optHeaders      cliflag.MapStringString
+	optPath         string
+	optAmplifyRatio int = 1
 
 	// parsed options
 	allowedMethods = sets.String{}
 	allowedHosts   = sets.String{}
-	pathRegexp     *regexp.Regexp
 )
 
 type replayRequest struct {
@@ -52,8 +52,9 @@ func init() {
 	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	flag.StringSliceVar(&optMethods, "methods", optMethods, "allowed methods")
 	flag.StringSliceVar(&optHosts, "hosts", optHosts, "allowed hosts")
-	flag.StringVar(&optPath, "path", optPath, "allowed path in regex")
+	flag.StringVar(&optPath, "path", optPath, "allowed path")
 	flag.Var(&optHeaders, "headers", "allowed headers in map")
+	flag.IntVar(&optAmplifyRatio, "amplify-ratio", optAmplifyRatio, "amplify ratio, e.g. 2, 5")
 	flag.Parse()
 
 	for _, m := range optMethods {
@@ -62,11 +63,10 @@ func init() {
 	for _, m := range optHosts {
 		allowedHosts.Insert(strings.ToLower(m))
 	}
-	pathRegexp = regexp.MustCompile(optPath)
 
 	// initialize cache
 	var err error
-	cache, err = lru.New(1024)
+	cache, err = lru.New(102400)
 	if err != nil {
 		klog.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func process(buf []byte) (skipped bool) {
 	defer func() {
 		if skipped {
 			if payloadType == '1' {
-				klog.V(1).Infof("skipped request: %s %s", req.Method, req.URL.String())
+				klog.V(2).Infof("skipped request %s: %s %s %s", reqID, req.Method, req.Host, req.URL.String())
 			}
 		}
 	}()
@@ -116,25 +116,29 @@ func process(buf []byte) (skipped bool) {
 			skipped = true
 			return
 		}
-		if !pathRegexp.MatchString(req.URL.Path) {
+		if !strings.HasPrefix(req.URL.Path, optPath) {
 			skipped = true
 			return
 		}
+		klog.V(2).Infof("got request %s: %s %s %s", reqID, req.Method, req.Host, req.URL.String())
 		cache.Add(reqID, &replayRequest{
 			ID:  reqID,
 			req: req,
 		})
-		// Emitting the request back
-		os.Stdout.Write(encode(buf))
+		// Emitting requests
+		for i := 0; i < optAmplifyRatio; i++ {
+			os.Stdout.Write(encode(buf))
+		}
 	case '2': // Orginal reponse
 		replayRequestFromCache, ok := cache.Get(reqID)
 		if !ok {
-			klog.Infof("request of ID %s does not exist, skipped", reqID)
+			klog.V(2).Infof("request of ID %s does not exist, skipped", reqID)
 			return
 		}
 		replayReq := replayRequestFromCache.(*replayRequest)
 		resp, err = http.ReadResponse(bufio.NewReader((bytes.NewReader(payload))), replayReq.req)
 		if err != nil {
+			panic(err)
 			klog.Fatal(err)
 		}
 		replayReq.respOrginal = resp
@@ -147,10 +151,15 @@ func process(buf []byte) (skipped bool) {
 		replayReq := replayRequestFromCache.(*replayRequest)
 		resp, err = http.ReadResponse(bufio.NewReader((bytes.NewReader(payload))), replayReq.req)
 		if err != nil {
+			panic(err)
 			klog.Fatal(err)
 		}
 		replayReq.respReplayed = resp
-		klog.Infof("[%s] %s %s, original status: %s, replay status: %s", replayReq.ID, replayReq.req.Method, replayReq.req.URL.String(), replayReq.respOrginal.Status, replayReq.respReplayed.Status)
+		if replayReq.respOrginal != nil {
+			klog.Infof("[%s] %s %s, original status: %s, replay status: %s", replayReq.ID, replayReq.req.Method, replayReq.req.URL.String(), replayReq.respOrginal.Status, replayReq.respReplayed.Status)
+		} else {
+			klog.Infof("[%s] %s %s replayed response %s", replayReq.ID, replayReq.req.Method, replayReq.req.URL.String(), resp.Status)
+		}
 	default:
 		panic("unreachable")
 	}
@@ -161,7 +170,9 @@ func main() {
 	flag.CommandLine.VisitAll(func(flag *flag.Flag) {
 		klog.Infof("FLAG: --%s=%q", flag.Name, flag.Value)
 	})
+
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer([]byte{}, maxInputSize)
 
 	for scanner.Scan() {
 		encoded := scanner.Bytes()
